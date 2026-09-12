@@ -6,11 +6,13 @@
 Требуемые переменные окружения:
     TELEGRAM_BOT_TOKEN
     TELEGRAM_CHAT_ID
-    GEMINI_API_KEY   (опционально — для доп. семантических тегов;
-                       если не задан, работает только на детерминированных тегах)
+    GEMINI_API_KEY   (нужен для генерации описания вакансии и доп. тегов;
+                       без него в посте не будет текста-описания, только
+                       "сухие" поля напрямую из API)
 """
 
 import os
+import re
 import json
 import time
 import yaml
@@ -45,6 +47,28 @@ EMPLOYMENT_LABELS = {
     "part": "частичная занятость",
     "unknown": "занятость не указана",
 }
+
+# Промпт для единого вызова LLM: описание + семантические теги за один запрос,
+# чтобы не тратить квоту на два отдельных вызова.
+DESCRIPTION_PROMPT = """Ты помогаешь оформлять посты о вакансиях для Telegram-канала.
+На основе данных вакансии ниже сделай:
+1. "description" — краткое (2-4 предложения) человеческое описание вакансии:
+   что предстоит делать и что важно для кандидата. Пиши живо, но по делу,
+   без канцелярита и без повторения того, что уже есть в других полях поста
+   (зарплата, регион, график и опыт указывать НЕ нужно — это уже есть отдельно).
+2. "tags" — список из 0-2 тегов СТРОГО из разрешённого списка: {allowed_tags}.
+   Указывай тег, только если он явно следует из текста ниже. Если ничего не
+   подходит — пустой список.
+
+Ответь строго JSON-объектом вида {{"description": "...", "tags": ["..."]}},
+без пояснений и без markdown-разметки.
+
+Должность: {job_name}
+Обязанности: {duty}
+Требования: {requirements}
+Квалификация/разряд: {qualification}
+Льготы/условия: {benefit}
+"""
 
 
 # ---------- Состояние (что уже опубликовано) ----------
@@ -116,8 +140,10 @@ def collect_all_vacancies(companies: list[dict]) -> list[dict]:
 # ---------- Детерминированные теги и поля напрямую из API ----------
 
 def guess_experience_label(requirement: dict) -> str | None:
-    """API отдаёт requirement.experience как число лет (может быть строкой)."""
+    """requirement.experience в реальном API — уже число лет (int)."""
     exp_raw = (requirement or {}).get("experience")
+    if exp_raw is None:
+        return None
     try:
         years = int(exp_raw)
     except (TypeError, ValueError):
@@ -132,6 +158,14 @@ def guess_experience_label(requirement: dict) -> str | None:
     return "опыт 6+ лет"
 
 
+def get_address(v: dict) -> str | None:
+    """Человекочитаемый адрес из addresses.address[0].location, если есть."""
+    addresses = (v.get("addresses") or {}).get("address") or []
+    if addresses and isinstance(addresses, list):
+        return addresses[0].get("location")
+    return None
+
+
 def guess_remote(v: dict) -> bool:
     """В API нет явного флага 'удалёнка' — определяем по тексту schedule/employment."""
     text = " ".join([
@@ -140,6 +174,14 @@ def guess_remote(v: dict) -> bool:
         str(v.get("job-name", "")),
     ]).lower()
     return any(kw in text for kw in ["удален", "дистанц", "надомн"])
+
+
+def sanitize_tag(text: str) -> str:
+    """Приводит произвольный текст к валидному Telegram-хэштегу:
+    только буквы/цифры/подчёркивания, без скобок и прочих спецсимволов."""
+    text = text.replace(" ", "_")
+    text = re.sub(r"[^\w]", "", text, flags=re.UNICODE)
+    return text.strip("_")
 
 
 def build_base_tags(v: dict, experience_label: str | None, remote: bool) -> set[str]:
@@ -165,10 +207,61 @@ def build_base_tags(v: dict, experience_label: str | None, remote: bool) -> set[
 
     region_name = (v.get("region") or {}).get("name")
     if region_name:
-        # Упрощаем название региона до одного тега без пробелов
-        tags.add(region_name.replace(" ", "_").replace(",", ""))
+        # Берём часть до скобок (например "Татарстан" из "Республика Татарстан (Татарстан)")
+        clean_region = region_name.split("(")[0].strip()
+        tag = sanitize_tag(clean_region)
+        if tag:
+            tags.add(tag)
 
     return tags
+
+
+def format_benefits(v: dict) -> str | None:
+    """API отдаёт льготы через запятую без пробелов — расставляем читаемо."""
+    raw = v.get("benefit")
+    if not raw:
+        return None
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    return " · ".join(items)
+
+
+PERSONAL_EMAIL_DOMAINS = {
+    "gmail.com", "yandex.ru", "ya.ru", "mail.ru", "rambler.ru",
+    "bk.ru", "inbox.ru", "list.ru", "outlook.com", "hotmail.com",
+    "icloud.com", "yahoo.com",
+}
+
+
+def get_contacts(v: dict) -> dict:
+    """
+    Достаёт телефон/почту/контактное лицо и пытается угадать официальный сайт
+    компании по домену корпоративной почты (не gmail/yandex/mail.ru и т.п.).
+    Это эвристика: если почта на общем почтовом сервисе — сайт не угадываем.
+    """
+    contact_list = v.get("contact_list") or []
+    phone, email = None, None
+    for c in contact_list:
+        ctype = (c.get("contact_type") or "").lower()
+        if "телефон" in ctype and not phone:
+            phone = c.get("contact_value")
+        elif "почта" in ctype and not email:
+            email = c.get("contact_value")
+
+    company_website = None
+    if email and "@" in email:
+        domain = email.split("@")[-1].strip().lower()
+        if domain and domain not in PERSONAL_EMAIL_DOMAINS:
+            company_website = f"https://{domain}"
+
+    # У компании в API есть ещё явное поле url — но это профиль на trudvsem.ru,
+    # а не сайт компании, поэтому его не используем как company_website.
+
+    return {
+        "phone": phone,
+        "email": email,
+        "contact_person": v.get("contact_person"),
+        "company_website": company_website,
+    }
 
 
 def format_salary(v: dict) -> str | None:
@@ -176,14 +269,16 @@ def format_salary(v: dict) -> str | None:
     lo = lo if lo else None
     hi = hi if hi else None
     if not lo and not hi:
-        return None
+        # Иногда есть только текстовое поле "salary" (например "от 124000")
+        salary_text = v.get("salary")
+        return f"{salary_text} ₽" if salary_text else None
     if lo and hi and lo != hi:
         return f"{int(lo):,} – {int(hi):,} ₽".replace(",", " ")
     val = lo or hi
     return f"от {int(val):,} ₽".replace(",", " ")
 
 
-# ---------- Опциональные семантические теги через Gemini ----------
+# ---------- Описание + семантические теги через Gemini (один вызов) ----------
 
 _gemini_client = None
 
@@ -195,37 +290,43 @@ def get_gemini_client():
     return _gemini_client
 
 
-def guess_semantic_tags(duty: str, requirement_text: str) -> list[str]:
-    """Необязательный шаг: просим Gemini выбрать 0-2 доп. тега по смыслу текста."""
+def generate_description_and_tags(v: dict) -> tuple[str | None, list[str]]:
+    """
+    Один вызов к Gemini: возвращает (краткое описание вакансии, доп. теги).
+    Если GEMINI_API_KEY не задан или запрос не удался — возвращает (None, []).
+    """
     client = get_gemini_client()
     if not client:
-        return []
+        return None, []
 
     from google.genai import types
 
-    prompt = (
-        "Из следующего описания вакансии выбери 0-2 тега, которые ПО СМЫСЛУ "
-        f"подходят, строго из списка: {', '.join(SEMANTIC_ALLOWED_TAGS)}. "
-        "Если ничего явно не подходит — верни пустой массив. "
-        "Ответь JSON-массивом строк, без пояснений.\n\n"
-        f"Обязанности: {duty[:1500]}\n"
-        f"Требования: {requirement_text[:1500]}"
+    requirement = v.get("requirement") or {}
+    prompt = DESCRIPTION_PROMPT.format(
+        allowed_tags=", ".join(SEMANTIC_ALLOWED_TAGS),
+        job_name=v.get("job-name", ""),
+        duty=(v.get("duty") or "")[:1500],
+        requirements=(v.get("requirements") or "")[:1000],
+        qualification=v.get("qualification") or requirement.get("education") or "",
+        benefit=(v.get("benefit") or "")[:500],
     )
+
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1,
+                temperature=0.4,
             ),
         )
-        tags = json.loads(response.text)
-        if isinstance(tags, list):
-            return [t for t in tags if t in SEMANTIC_ALLOWED_TAGS]
+        data = json.loads(response.text)
+        description = data.get("description")
+        tags = [t for t in data.get("tags", []) if t in SEMANTIC_ALLOWED_TAGS]
+        return description, tags
     except Exception as e:
-        print(f"  [warn] семантические теги не удались: {e}")
-    return []
+        print(f"  [warn] генерация описания/тегов не удалась: {e}")
+        return None, []
 
 
 # ---------- Рендер поста ----------
@@ -237,26 +338,39 @@ def render_post(v: dict, template_text: str) -> str:
 
     tags = build_base_tags(v, experience_label, remote)
 
-    duty = v.get("duty", "") or ""
-    requirement_text = requirement.get("qualification", "") or ""
-    tags.update(guess_semantic_tags(duty, requirement_text))
+    description, extra_tags = generate_description_and_tags(v)
+    tags.update(sanitize_tag(t) for t in extra_tags if sanitize_tag(t))
 
     employment_key = "full" if "полн" in str(v.get("employment", "")).lower() else (
         "part" if "част" in str(v.get("employment", "")).lower() else "unknown"
     )
 
+    contacts = get_contacts(v)
+
     template = Template(template_text)
-    return template.render(
+    rendered = template.render(
         title=v.get("job-name", "Без названия"),
         company=v.get("_company_display_name") or (v.get("company") or {}).get("name", ""),
         region=(v.get("region") or {}).get("name", "Не указано"),
+        address=get_address(v),
         remote=remote,
         employment_label=EMPLOYMENT_LABELS[employment_key],
+        schedule=v.get("schedule"),
         experience_label=experience_label,
         salary_text=format_salary(v),
+        description=description,
+        benefits=format_benefits(v),
+        phone=contacts["phone"],
+        email=contacts["email"],
+        contact_person=contacts["contact_person"],
+        company_website=contacts["company_website"],
+        vac_url=v.get("vac_url", ""),
         tags=[f"#{t}" for t in sorted(tags)],
-        url=v.get("vac_url", ""),
     )
+    # Схлопываем 3+ подряд пустых строк, которые могут возникнуть из-за
+    # необязательных {% if %}-блоков в шаблоне (например, когда нет description)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    return rendered.strip()
 
 
 # ---------- Отправка в Telegram ----------
