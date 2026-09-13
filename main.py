@@ -90,7 +90,10 @@ def save_state(state: dict) -> None:
 def fetch_company_vacancies(company: dict) -> list[dict]:
     """Постранично забирает все вакансии компании по ИНН/ОГРН."""
     id_type = company["id_type"]
-    company_id = str(company["id"])
+    # Убираем пробелы/табы/переносы строк — частая проблема при копировании
+    # ИНН из таблиц (Excel и т.п.), из-за которой ломается URL запроса.
+    company_id = str(company["id"]).strip()
+    company_id = re.sub(r"\s+", "", company_id)
     url = f"{API_BASE}/{id_type}/{company_id}"
 
     all_vacancies = []
@@ -294,6 +297,10 @@ def generate_description_and_tags(v: dict) -> tuple[str | None, list[str]]:
     """
     Один вызов к Gemini: возвращает (краткое описание вакансии, доп. теги).
     Если GEMINI_API_KEY не задан или запрос не удался — возвращает (None, []).
+
+    Бесплатный тариф Gemini жёстко ограничен по запросам в минуту (обычно 5-15
+    в зависимости от модели), поэтому при 429 RESOURCE_EXHAUSTED делаем
+    несколько попыток с паузой, а не сразу сдаёмся.
     """
     client = get_gemini_client()
     if not client:
@@ -311,22 +318,32 @@ def generate_description_and_tags(v: dict) -> tuple[str | None, list[str]]:
         benefit=(v.get("benefit") or "")[:500],
     )
 
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.4,
-            ),
-        )
-        data = json.loads(response.text)
-        description = data.get("description")
-        tags = [t for t in data.get("tags", []) if t in SEMANTIC_ALLOWED_TAGS]
-        return description, tags
-    except Exception as e:
-        print(f"  [warn] генерация описания/тегов не удалась: {e}")
-        return None, []
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.4,
+                ),
+            )
+            data = json.loads(response.text)
+            description = data.get("description")
+            tags = [t for t in data.get("tags", []) if t in SEMANTIC_ALLOWED_TAGS]
+            return description, tags
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+            if is_rate_limit and attempt < max_retries:
+                wait_seconds = 15 * attempt  # 15с, потом 30с
+                print(f"  [warn] лимит Gemini исчерпан, жду {wait_seconds}с "
+                      f"(попытка {attempt}/{max_retries})...")
+                time.sleep(wait_seconds)
+                continue
+            print(f"  [warn] генерация описания/тегов не удалась: {e}")
+            return None, []
+    return None, []
 
 
 # ---------- Рендер поста ----------
@@ -400,6 +417,20 @@ def main():
     with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
         template_text = f.read()
 
+    # Быстрая проверка конфигурации Telegram перед тем как тратить запросы к API вакансий:
+    # если chat_id неверный, лучше упасть сразу с понятной подсказкой.
+    try:
+        resp = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat",
+                          params={"chat_id": TELEGRAM_CHAT_ID}, timeout=15)
+        if resp.status_code != 200:
+            print(f"[error] Telegram getChat вернул {resp.status_code}: {resp.text}")
+            print("  Проверьте TELEGRAM_CHAT_ID и что бот добавлен в канал/чат как администратор.")
+            print("  Как получить правильный chat_id для канала — см. README.md.")
+            return
+    except Exception as e:
+        print(f"[error] не удалось проверить Telegram chat: {e}")
+        return
+
     state = load_state()
     posted_ids = set(state.get("posted_ids", []))
 
@@ -418,7 +449,12 @@ def main():
             posted_ids.add(vac_id)
             new_count += 1
             print(f"  [posted] {v.get('job-name')} — {v.get('_company_display_name')}")
-            time.sleep(3)  # анти-флуд лимит Telegram
+            if GEMINI_API_KEY:
+                # 13с между вакансиями: бесплатный лимит Gemini — 5 запросов/мин
+                # (60/5=12с), плюс небольшой запас и анти-флуд лимит Telegram.
+                time.sleep(13)
+            else:
+                time.sleep(3)  # только анти-флуд лимит Telegram
         except Exception as e:
             print(f"  [error] не удалось обработать/отправить вакансию {vac_id}: {e}")
 
