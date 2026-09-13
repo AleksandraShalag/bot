@@ -8,13 +8,17 @@
 # id_type: "inn"  -> используется /vacancies/company/inn/{id}
 # id_type: "ogrn" -> используется /vacancies/company/ogrn/{id}
 
-- name: "ПАО НИЖНЕКАМСКШИНА"
-  id_type: "inn"
-  id: "1651000027"
+#- name: "ПАО НИЖНЕКАМСКШИНА"
+#  id_type: "inn"
+#  id: "1651000027"
 
-- name: "АО ТАИФ-НК"
+- name: "ФГБУЗ ЦКС МАЛАХОВКА"
   id_type: "inn"
-  id: "1651025328"
+  id: "5027036613"
+
+#- name: "АО ТАИФ-НК"
+#  id_type: "inn"
+#  id: "1651025328"
 
 # - name: "Ещё одна компания"
 #   id_type: "ogrn"
