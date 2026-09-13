@@ -42,18 +42,17 @@ jobs:
           git config user.name "vacancy-bot"
           git config user.email "actions@users.noreply.github.com"
 
-          git add state.json
+          git add state.json pending_posts.json 2>/dev/null || git add state.json
           if git diff --cached --quiet; then
-            echo "Нет изменений в state.json — пропускаем коммит"
+            echo "Нет изменений — пропускаем коммит"
             exit 0
           fi
           git commit -m "chore: update posted vacancies state [skip ci]"
 
-          # Ветка могла уйти вперёд (параллельный запуск/ручной пуш) —
-          # подтягиваем и переигрываем наш коммит поверх. К этому моменту
-          # рабочая директория уже чистая (изменения закоммичены выше),
-          # поэтому pull --rebase пройдёт без ошибки "unstaged changes".
-          git pull --rebase origin main
-          git push origin main
+          # На случай что рабочая директория всё же не идеально чистая
+          git stash -u || true
 
-    
+          git pull --rebase origin main
+          git stash pop || true
+
+          git push origin main
