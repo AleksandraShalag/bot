@@ -32,7 +32,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # необязателен
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 
 # Белый список для семантических тегов (генерируются LLM из текста вакансии,
 # если GEMINI_API_KEY задан). Детерминированные теги (город/опыт/занятость/
