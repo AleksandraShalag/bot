@@ -9,14 +9,16 @@ on:
 permissions:
   contents: write   # нужно, чтобы коммитить обновлённый state.json обратно в репо
 
+concurrency:
+  group: vacancy-bot-daily
+  cancel-in-progress: false   # не отменяем предыдущий запуск, а ждём его завершения
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # получить полную историю для pull --rebase
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,7 +41,19 @@ jobs:
         run: |
           git config user.name "vacancy-bot"
           git config user.email "actions@users.noreply.github.com"
-          git pull --rebase origin main
+
           git add state.json
-          git diff --cached --quiet || git commit -m "chore: update posted vacancies state [skip ci]"
+          if git diff --cached --quiet; then
+            echo "Нет изменений в state.json — пропускаем коммит"
+            exit 0
+          fi
+          git commit -m "chore: update posted vacancies state [skip ci]"
+
+          # Ветка могла уйти вперёд (параллельный запуск/ручной пуш) —
+          # подтягиваем и переигрываем наш коммит поверх. К этому моменту
+          # рабочая директория уже чистая (изменения закоммичены выше),
+          # поэтому pull --rebase пройдёт без ошибки "unstaged changes".
+          git pull --rebase origin main
           git push origin main
+
+    
