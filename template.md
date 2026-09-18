@@ -4,9 +4,9 @@
 💼 {{ employment_label }}{% if schedule %} · {{ schedule }}{% endif %}{% if experience_label %} · {{ experience_label }}{% endif %}
 {% if salary_text %}💰 {{ salary_text }}
 {% endif %}
-{% if description %}
-{{ description }}
-{% endif %}
+{% if duties %}📋 Что предстоит делать:
+{% for d in duties %}▫️ {{ d }}
+{% endfor %}{% endif %}
 {% if benefits %}✅ Условия: {{ benefits }}
 {% endif %}
 {{ tags | join(' ') }}
