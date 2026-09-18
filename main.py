@@ -1,46 +1,35 @@
 """
-Вакансии из официального API «Работа в России» (opendata.trudvsem.ru)
-по списку компаний -> теги -> пост в Telegram.
+Вакансии из API «Работа в России» -> теги + список обязанностей (без LLM) ->
+нативная отложенная публикация в Telegram-канал через MTProto (Telethon).
 
-Запуск: python main.py
-Требуемые переменные окружения:
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-    GEMINI_API_KEY   (нужен для генерации описания вакансии и доп. тегов;
-                       без него в посте не будет текста-описания, только
-                       "сухие" поля напрямую из API)
+Скрипт запускается раз в день по крону (GitHub Actions), ставит посты в
+отложку канала на текущее время + POST_DELAY_HOURS и завершается. Telegram
+сам публикует их по расписанию — работающий процесс для этого не нужен.
 """
 
 import os
 import re
 import json
-import time
 import yaml
 import httpx
+import asyncio
+from datetime import datetime, timedelta, timezone
 from jinja2 import Template
-
-# ---------- Конфигурация ----------
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 COMPANIES_FILE = "companies.yaml"
 TEMPLATE_FILE = "template.md"
-STATE_FILE = "state.json"
+SEEN_FILE = "seen_ids.json"
 
 API_BASE = "https://opendata.trudvsem.ru/api/v1/vacancies/company"
-PAGE_LIMIT = 100  # максимум, который отдаёт API за один запрос
+PAGE_LIMIT = 100
+POST_DELAY_HOURS = 6  # через сколько часов после запуска публиковать
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # необязателен
-
-GEMINI_MODEL = "gemini-3.6-flash"
-
-# Белый список для семантических тегов (генерируются LLM из текста вакансии,
-# если GEMINI_API_KEY задан). Детерминированные теги (город/опыт/занятость/
-# удалёнка) генерируются напрямую из полей API без LLM — см. build_base_tags().
-SEMANTIC_ALLOWED_TAGS = [
-    "релокация", "вахта", "график5_2", "сменный_график",
-    "соцпакет", "жильё", "молодежная_программа",
-]
+API_ID = int(os.environ["TELEGRAM_API_ID"])
+API_HASH = os.environ["TELEGRAM_API_HASH"]
+SESSION_STRING = os.environ["TELEGRAM_SESSION"]
+CHANNEL = os.environ["TELEGRAM_CHANNEL"]  # @username канала или его numeric id
 
 EMPLOYMENT_LABELS = {
     "full": "полная занятость",
@@ -48,61 +37,34 @@ EMPLOYMENT_LABELS = {
     "unknown": "занятость не указана",
 }
 
-# Промпт для единого вызова LLM: описание + семантические теги за один запрос,
-# чтобы не тратить квоту на два отдельных вызова.
-DESCRIPTION_PROMPT = """Ты помогаешь оформлять посты о вакансиях для Telegram-канала.
-На основе данных вакансии ниже сделай:
-1. "description" — краткое (2-4 предложения) человеческое описание вакансии:
-   что предстоит делать и что важно для кандидата. Пиши живо, но по делу,
-   без канцелярита и без повторения того, что уже есть в других полях поста
-   (зарплата, регион, график и опыт указывать НЕ нужно — это уже есть отдельно).
-2. "tags" — список из 0-2 тегов СТРОГО из разрешённого списка: {allowed_tags}.
-   Указывай тег, только если он явно следует из текста ниже. Если ничего не
-   подходит — пустой список.
 
-Ответь строго JSON-объектом вида {{"description": "...", "tags": ["..."]}},
-без пояснений и без markdown-разметки.
+# ---------- seen_ids ----------
 
-Должность: {job_name}
-Обязанности: {duty}
-Требования: {requirements}
-Квалификация/разряд: {qualification}
-Льготы/условия: {benefit}
-"""
+def load_seen() -> set:
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
 
 
-# ---------- Состояние (что уже опубликовано) ----------
-
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"posted_ids": []}
-
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+def save_seen(seen: set) -> None:
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
 # ---------- Сбор вакансий из API ----------
 
 def fetch_company_vacancies(company: dict) -> list[dict]:
-    """Постранично забирает все вакансии компании по ИНН/ОГРН."""
     id_type = company["id_type"]
-    # Убираем пробелы/табы/переносы строк — частая проблема при копировании
-    # ИНН из таблиц (Excel и т.п.), из-за которой ломается URL запроса.
-    company_id = str(company["id"]).strip()
-    company_id = re.sub(r"\s+", "", company_id)
+    company_id = re.sub(r"\s+", "", str(company["id"]).strip())
     url = f"{API_BASE}/{id_type}/{company_id}"
 
     all_vacancies = []
     offset = 0
     with httpx.Client(timeout=30) as client_http:
         while True:
-            params = {"limit": PAGE_LIMIT, "offset": offset}
             try:
-                resp = client_http.get(url, params=params)
+                resp = client_http.get(url, params={"limit": PAGE_LIMIT, "offset": offset})
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
@@ -112,16 +74,13 @@ def fetch_company_vacancies(company: dict) -> list[dict]:
             vacancies = data.get("results", {}).get("vacancies", [])
             if not vacancies:
                 break
-
             for item in vacancies:
                 v = item.get("vacancy", {})
                 if v:
                     all_vacancies.append(v)
-
             if len(vacancies) < PAGE_LIMIT:
                 break
             offset += PAGE_LIMIT
-
     return all_vacancies
 
 
@@ -140,10 +99,9 @@ def collect_all_vacancies(companies: list[dict]) -> list[dict]:
     return all_vacancies
 
 
-# ---------- Детерминированные теги и поля напрямую из API ----------
+# ---------- Теги и поля напрямую из API (без LLM) ----------
 
 def guess_experience_label(requirement: dict) -> str | None:
-    """requirement.experience в реальном API — уже число лет (int)."""
     exp_raw = (requirement or {}).get("experience")
     if exp_raw is None:
         return None
@@ -151,7 +109,6 @@ def guess_experience_label(requirement: dict) -> str | None:
         years = int(exp_raw)
     except (TypeError, ValueError):
         return None
-
     if years <= 0:
         return "без опыта"
     if years <= 3:
@@ -162,7 +119,6 @@ def guess_experience_label(requirement: dict) -> str | None:
 
 
 def get_address(v: dict) -> str | None:
-    """Человекочитаемый адрес из addresses.address[0].location, если есть."""
     addresses = (v.get("addresses") or {}).get("address") or []
     if addresses and isinstance(addresses, list):
         return addresses[0].get("location")
@@ -170,7 +126,6 @@ def get_address(v: dict) -> str | None:
 
 
 def guess_remote(v: dict) -> bool:
-    """В API нет явного флага 'удалёнка' — определяем по тексту schedule/employment."""
     text = " ".join([
         str(v.get("schedule", "")),
         str(v.get("employment", "")),
@@ -180,19 +135,15 @@ def guess_remote(v: dict) -> bool:
 
 
 def sanitize_tag(text: str) -> str:
-    """Приводит произвольный текст к валидному Telegram-хэштегу:
-    только буквы/цифры/подчёркивания, без скобок и прочих спецсимволов."""
     text = text.replace(" ", "_")
     text = re.sub(r"[^\w]", "", text, flags=re.UNICODE)
     return text.strip("_")
 
 
-def build_base_tags(v: dict, experience_label: str | None, remote: bool) -> set[str]:
+def build_base_tags(v: dict, experience_label: str | None, remote: bool) -> set:
     tags = set()
-
     if remote:
         tags.add("удаленка")
-
     if experience_label == "без опыта":
         tags.add("безопыта")
 
@@ -210,22 +161,37 @@ def build_base_tags(v: dict, experience_label: str | None, remote: bool) -> set[
 
     region_name = (v.get("region") or {}).get("name")
     if region_name:
-        # Берём часть до скобок (например "Татарстан" из "Республика Татарстан (Татарстан)")
         clean_region = region_name.split("(")[0].strip()
         tag = sanitize_tag(clean_region)
         if tag:
             tags.add(tag)
-
     return tags
 
 
 def format_benefits(v: dict) -> str | None:
-    """API отдаёт льготы через запятую без пробелов — расставляем читаемо."""
     raw = v.get("benefit")
     if not raw:
         return None
     items = [item.strip() for item in raw.split(",") if item.strip()]
     return " · ".join(items)
+
+
+def split_into_bullets(text: str, max_items: int = 6) -> list[str]:
+    """Разбивает 'duty' (обязанности) на пункты без LLM — по явным
+    разделителям (переносы строк, буллеты, нумерация), а если их нет —
+    по предложениям."""
+    if not text:
+        return []
+    text = text.strip()
+
+    parts = re.split(r"[\n;•]|(?:^|\s)-\s+|(?:^|\s)\d+[.)]\s+", text)
+    parts = [p.strip(" .;-") for p in parts if p and p.strip(" .;-")]
+
+    if len(parts) < 2:
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        parts = [p.strip(" .;-") for p in parts if p and p.strip(" .;-")]
+
+    return parts[:max_items]
 
 
 PERSONAL_EMAIL_DOMAINS = {
@@ -236,11 +202,6 @@ PERSONAL_EMAIL_DOMAINS = {
 
 
 def get_contacts(v: dict) -> dict:
-    """
-    Достаёт телефон/почту/контактное лицо и пытается угадать официальный сайт
-    компании по домену корпоративной почты (не gmail/yandex/mail.ru и т.п.).
-    Это эвристика: если почта на общем почтовом сервисе — сайт не угадываем.
-    """
     contact_list = v.get("contact_list") or []
     phone, email = None, None
     for c in contact_list:
@@ -256,9 +217,6 @@ def get_contacts(v: dict) -> dict:
         if domain and domain not in PERSONAL_EMAIL_DOMAINS:
             company_website = f"https://{domain}"
 
-    # У компании в API есть ещё явное поле url — но это профиль на trudvsem.ru,
-    # а не сайт компании, поэтому его не используем как company_website.
-
     return {
         "phone": phone,
         "email": email,
@@ -272,7 +230,6 @@ def format_salary(v: dict) -> str | None:
     lo = lo if lo else None
     hi = hi if hi else None
     if not lo and not hi:
-        # Иногда есть только текстовое поле "salary" (например "от 124000")
         salary_text = v.get("salary")
         return f"{salary_text} ₽" if salary_text else None
     if lo and hi and lo != hi:
@@ -281,88 +238,19 @@ def format_salary(v: dict) -> str | None:
     return f"от {int(val):,} ₽".replace(",", " ")
 
 
-# ---------- Описание + семантические теги через Gemini (один вызов) ----------
-
-_gemini_client = None
-
-def get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None and GEMINI_API_KEY:
-        from google import genai
-        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
-
-
-def generate_description_and_tags(v: dict) -> tuple[str | None, list[str]]:
-    """
-    Один вызов к Gemini: возвращает (краткое описание вакансии, доп. теги).
-    Если GEMINI_API_KEY не задан или запрос не удался — возвращает (None, []).
-
-    Бесплатный тариф Gemini жёстко ограничен по запросам в минуту (обычно 5-15
-    в зависимости от модели), поэтому при 429 RESOURCE_EXHAUSTED делаем
-    несколько попыток с паузой, а не сразу сдаёмся.
-    """
-    client = get_gemini_client()
-    if not client:
-        return None, []
-
-    from google.genai import types
-
-    requirement = v.get("requirement") or {}
-    prompt = DESCRIPTION_PROMPT.format(
-        allowed_tags=", ".join(SEMANTIC_ALLOWED_TAGS),
-        job_name=v.get("job-name", ""),
-        duty=(v.get("duty") or "")[:1500],
-        requirements=(v.get("requirements") or "")[:1000],
-        qualification=v.get("qualification") or requirement.get("education") or "",
-        benefit=(v.get("benefit") or "")[:500],
-    )
-
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.4,
-                ),
-            )
-            data = json.loads(response.text)
-            description = data.get("description")
-            tags = [t for t in data.get("tags", []) if t in SEMANTIC_ALLOWED_TAGS]
-            return description, tags
-        except Exception as e:
-            is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
-            if is_rate_limit and attempt < max_retries:
-                wait_seconds = 15 * attempt  # 15с, потом 30с
-                print(f"  [warn] лимит Gemini исчерпан, жду {wait_seconds}с "
-                      f"(попытка {attempt}/{max_retries})...")
-                time.sleep(wait_seconds)
-                continue
-            print(f"  [warn] генерация описания/тегов не удалась: {e}")
-            return None, []
-    return None, []
-
-
 # ---------- Рендер поста ----------
 
 def render_post(v: dict, template_text: str) -> str:
     requirement = v.get("requirement") or {}
     experience_label = guess_experience_label(requirement)
     remote = guess_remote(v)
-
     tags = build_base_tags(v, experience_label, remote)
-
-    description, extra_tags = generate_description_and_tags(v)
-    tags.update(sanitize_tag(t) for t in extra_tags if sanitize_tag(t))
 
     employment_key = "full" if "полн" in str(v.get("employment", "")).lower() else (
         "part" if "част" in str(v.get("employment", "")).lower() else "unknown"
     )
-
     contacts = get_contacts(v)
+    duties = split_into_bullets(v.get("duty"))
 
     template = Template(template_text)
     rendered = template.render(
@@ -375,7 +263,7 @@ def render_post(v: dict, template_text: str) -> str:
         schedule=v.get("schedule"),
         experience_label=experience_label,
         salary_text=format_salary(v),
-        description=description,
+        duties=duties,
         benefits=format_benefits(v),
         phone=contacts["phone"],
         email=contacts["email"],
@@ -384,84 +272,59 @@ def render_post(v: dict, template_text: str) -> str:
         vac_url=v.get("vac_url", ""),
         tags=[f"#{t}" for t in sorted(tags)],
     )
-    # Схлопываем 3+ подряд пустых строк, которые могут возникнуть из-за
-    # необязательных {% if %}-блоков в шаблоне (например, когда нет description)
     rendered = re.sub(r"\n{3,}", "\n\n", rendered)
     return rendered.strip()
 
 
-# ---------- Отправка в Telegram ----------
+# ---------- Основной сценарий ----------
 
-def send_to_telegram(text: str) -> None:
-    resp = httpx.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        print(f"  [error] Telegram API: {resp.status_code} {resp.text}")
-    resp.raise_for_status()
-
-
-# ---------- Main pipeline ----------
-
-def main():
+async def main():
     with open(COMPANIES_FILE, "r", encoding="utf-8") as f:
         companies = yaml.safe_load(f)
-
     with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
         template_text = f.read()
 
-    # Быстрая проверка конфигурации Telegram перед тем как тратить запросы к API вакансий:
-    # если chat_id неверный, лучше упасть сразу с понятной подсказкой.
-    try:
-        resp = httpx.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getChat",
-                          params={"chat_id": TELEGRAM_CHAT_ID}, timeout=15)
-        if resp.status_code != 200:
-            print(f"[error] Telegram getChat вернул {resp.status_code}: {resp.text}")
-            print("  Проверьте TELEGRAM_CHAT_ID и что бот добавлен в канал/чат как администратор.")
-            print("  Как получить правильный chat_id для канала — см. README.md.")
-            return
-    except Exception as e:
-        print(f"[error] не удалось проверить Telegram chat: {e}")
-        return
-
-    state = load_state()
-    posted_ids = set(state.get("posted_ids", []))
-
+    seen = load_seen()
     vacancies = collect_all_vacancies(companies)
     print(f"\nВсего собрано вакансий: {len(vacancies)}")
 
-    new_count = 0
+    new_posts = []
     for v in vacancies:
         vac_id = v.get("id")
-        if not vac_id or vac_id in posted_ids:
+        if not vac_id or vac_id in seen:
             continue
-
         try:
             post_text = render_post(v, template_text)
-            send_to_telegram(post_text)
-            posted_ids.add(vac_id)
-            new_count += 1
-            print(f"  [posted] {v.get('job-name')} — {v.get('_company_display_name')}")
-            if GEMINI_API_KEY:
-                # 13с между вакансиями: бесплатный лимит Gemini — 5 запросов/мин
-                # (60/5=12с), плюс небольшой запас и анти-флуд лимит Telegram.
-                time.sleep(13)
-            else:
-                time.sleep(3)  # только анти-флуд лимит Telegram
         except Exception as e:
-            print(f"  [error] не удалось обработать/отправить вакансию {vac_id}: {e}")
+            print(f"  [error] не удалось отрендерить вакансию {vac_id}: {e}")
+            continue
+        new_posts.append((vac_id, v.get("job-name"), v.get("_company_display_name"), post_text))
 
-    state["posted_ids"] = list(posted_ids)
-    save_state(state)
-    print(f"\nГотово. Новых постов: {new_count}")
+    if not new_posts:
+        print("Новых вакансий нет — планировать нечего.")
+        return
+
+    async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
+        entity = await client.get_entity(CHANNEL)
+
+        # Каждый следующий пост ставим на пару минут позже предыдущего,
+        # чтобы они не выходили все одновременно одной пачкой.
+        base_time = datetime.now(timezone.utc) + timedelta(hours=POST_DELAY_HOURS)
+        for i, (vac_id, job_name, company_name, post_text) in enumerate(new_posts):
+            schedule_time = base_time + timedelta(minutes=3 * i)
+            await client.send_message(
+                entity,
+                post_text,
+                parse_mode="html",
+                schedule=schedule_time,
+                link_preview=False,
+            )
+            seen.add(vac_id)
+            print(f"  [scheduled] {job_name} — {company_name} -> {schedule_time.isoformat()}")
+
+    save_seen(seen)
+    print(f"\nГотово. Поставлено в отложку: {len(new_posts)}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
