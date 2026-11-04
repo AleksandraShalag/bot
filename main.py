@@ -76,7 +76,9 @@ def fetch_company_vacancies(company: dict) -> list[dict]:
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
-@@ -112,16 +74,13 @@ def fetch_company_vacancies(company: dict) -> list[dict]:
+                print(f"  [error] Ошибка запроса к API для {company_id}: {e}")
+                break
+
             vacancies = data.get("results", {}).get("vacancies", [])
             if not vacancies:
                 break
@@ -91,6 +93,7 @@ def fetch_company_vacancies(company: dict) -> list[dict]:
             offset += PAGE_LIMIT
 
     return all_vacancies
+
 
 
 def collect_all_vacancies(companies: list[dict]) -> list[dict]:
