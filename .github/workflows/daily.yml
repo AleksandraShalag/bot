@@ -2,7 +2,7 @@ name: Daily vacancy fetch & schedule
 
 on:
   schedule:
-    - cron: "30 8 * * *"
+    - cron: "40 5 * * *"
   workflow_dispatch: {}
 
 permissions:
