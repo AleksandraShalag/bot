@@ -237,17 +237,12 @@ def get_contacts(v: dict) -> dict:
         elif "почта" in ctype and not email:
             email = c.get("contact_value")
 
-    company_website = None
-    if email and "@" in email:
-        domain = email.split("@")[-1].strip().lower()
-        if domain and domain not in PERSONAL_EMAIL_DOMAINS:
-            company_website = f"https://{domain}"
+    
 
     return {
         "phone": phone,
         "email": email,
         "contact_person": v.get("contact_person"),
-        "company_website": company_website,
     }
 
 
@@ -294,7 +289,6 @@ def render_post(v: dict, template_text: str) -> str:
         phone=contacts["phone"],
         email=contacts["email"],
         contact_person=contacts["contact_person"],
-        company_website=contacts["company_website"],
         vac_url=v.get("vac_url", ""),
         tags=[f"#{t}" for t in sorted(tags)],
     )
