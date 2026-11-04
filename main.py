@@ -55,59 +55,61 @@ def save_seen(seen: set) -> None:
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
+import time
 
-# ---------- Сбор вакансий из API ----------
+API_BASE = "https://opendata.trudvsem.ru/api/v1/vacancies/company"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; vacancy-bot/1.0)",
+    "Accept": "application/json",
+}
+
+
+def _get_with_retry(client, url, params, attempts=4):
+    """GET с повтором при 429/5xx/сетевых сбоях и растущей паузой."""
+    for attempt in range(attempts):
+        try:
+            resp = client.get(url, params=params)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise httpx.HTTPStatusError(
+                    f"retryable {resp.status_code}", request=resp.request, response=resp
+                )
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            if attempt == attempts - 1:
+                raise
+            wait = 5 * (2 ** attempt)
+            print(f"  [retry] {e}; повтор через {wait}с")
+            time.sleep(wait)
+
+
 def fetch_company_vacancies(company: dict) -> list[dict]:
-    """Постранично забирает все вакансии компании по ИНН/ОГРН."""
     id_type = company["id_type"]
-    # Убираем пробелы/табы/переносы строк — частая проблема при копировании
-    # ИНН из таблиц (Excel и т.п.), из-за которой ломается URL запроса.
-    company_id = str(company["id"]).strip()
-    company_id = re.sub(r"\s+", "", company_id)
+    company_id = re.sub(r"\s+", "", str(company["id"]))
     url = f"{API_BASE}/{id_type}/{company_id}"
 
     all_vacancies = []
     offset = 0
-    with httpx.Client(timeout=30) as client_http:
+    with httpx.Client(timeout=30, headers=HEADERS) as client_http:
         while True:
-            params = {"limit": PAGE_LIMIT, "offset": offset}
             try:
-                resp = client_http.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
+                data = _get_with_retry(client_http, url, {"limit": PAGE_LIMIT, "offset": offset})
             except Exception as e:
                 print(f"  [error] Ошибка запроса к API для {company_id}: {e}")
                 break
 
-            vacancies = data.get("results", {}).get("vacancies", [])
+            vacancies = (data.get("results") or {}).get("vacancies") or []
             if not vacancies:
                 break
-
             for item in vacancies:
-                v = item.get("vacancy", {})
+                v = item.get("vacancy")
                 if v:
                     all_vacancies.append(v)
 
             if len(vacancies) < PAGE_LIMIT:
                 break
             offset += PAGE_LIMIT
-
-    return all_vacancies
-
-
-
-def collect_all_vacancies(companies: list[dict]) -> list[dict]:
-    all_vacancies = []
-    for company in companies:
-        print(f"[fetch] {company['name']} ({company['id_type']}={company['id']})")
-        try:
-            items = fetch_company_vacancies(company)
-            for item in items:
-                item["_company_display_name"] = company["name"]
-            all_vacancies.extend(items)
-            print(f"  -> найдено {len(items)} вакансий")
-        except Exception as e:
-            print(f"  [error] компания {company['name']} упала: {e}")
+            time.sleep(1)
     return all_vacancies
 
 
