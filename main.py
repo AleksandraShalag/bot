@@ -13,6 +13,8 @@ import json
 import yaml
 import httpx
 import asyncio
+import io
+from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timedelta, timezone
 from jinja2 import Template
 from telethon import TelegramClient
@@ -38,7 +40,104 @@ EMPLOYMENT_LABELS = {
     "unknown": "занятость не указана",
 }
 
+# ---------- Картинка ----------
 
+IMG_SIZE = (1080, 1080)
+IMG_BG = "#1F3A5F"
+IMG_TEXT = "#FFFFFF"
+IMG_ACCENT = "#FFD54A"
+IMG_PADDING = 80
+
+FONT_BOLD_CANDIDATES = [
+    "fonts/bold.ttf",  # можно положить свой шрифт в репозиторий
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+
+
+def load_font(size: int) -> ImageFont.FreeTypeFont:
+    for path in FONT_BOLD_CANDIDATES:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    raise RuntimeError("Не найден шрифт с кириллицей для генерации картинки")
+
+
+def wrap_text(draw, text: str, font, max_width: int) -> list[str]:
+    lines, line = [], ""
+    for word in text.split():
+        test = f"{line} {word}".strip()
+        if draw.textlength(test, font=font) <= max_width:
+            line = test
+        else:
+            if line:
+                lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    return lines
+
+
+def extract_city(v: dict) -> str:
+    """Город из адреса ('г. Казань', 'город Нижнекамск'), иначе регион."""
+    address = get_address(v) or ""
+    m = re.search(r"(?:г\.|город)\s*([А-ЯЁA-Z][\w\-]*(?:\s[А-ЯЁ][\w\-]*)?)", address)
+    if m:
+        return m.group(1).strip(" ,")
+    region = (v.get("region") or {}).get("name") or ""
+    return region.split("(")[0].strip()
+
+
+def fit_block(draw, text, max_size, min_size, max_lines, max_width):
+    """Подбирает самый крупный размер шрифта, при котором текст влезает."""
+    for size in range(max_size, min_size - 1, -4):
+        font = load_font(size)
+        lines = wrap_text(draw, text, font, max_width)
+        if len(lines) <= max_lines:
+            return font, lines
+    font = load_font(min_size)
+    return font, wrap_text(draw, text, font, max_width)[:max_lines]
+
+
+def generate_image(v: dict) -> io.BytesIO:
+    img = Image.new("RGB", IMG_SIZE, IMG_BG)
+    draw = ImageDraw.Draw(img)
+    max_w = IMG_SIZE[0] - 2 * IMG_PADDING
+
+    title = str(v.get("job-name", "Без названия")).upper()
+    city = extract_city(v).upper()
+    company = str(v.get("_company_display_name") or (v.get("company") or {}).get("name", "")).upper()
+    salary = (format_salary(v) or "").upper()
+
+    blocks = []  # (шрифт, строки, цвет, отступ после блока)
+    f, l = fit_block(draw, title, 110, 52, 5, max_w)
+    blocks.append((f, l, IMG_TEXT, 60))
+    if city:
+        f, l = fit_block(draw, city, 56, 36, 2, max_w)
+        blocks.append((f, l, IMG_TEXT, 36))
+    if company:
+        f, l = fit_block(draw, company, 48, 30, 3, max_w)
+        blocks.append((f, l, IMG_TEXT, 60))
+    if salary:
+        f, l = fit_block(draw, salary, 80, 40, 2, max_w)
+        blocks.append((f, l, IMG_ACCENT, 0))
+
+    def line_h(font):
+        b = font.getbbox("АЙgу")
+        return int((b[3] - b[1]) * 1.25)
+
+    total = sum(line_h(f) * len(l) + gap for f, l, _, gap in blocks)
+    y = (IMG_SIZE[1] - total) // 2
+    for font, lines, color, gap in blocks:
+        for line in lines:
+            draw.text((IMG_PADDING, y), line, font=font, fill=color)
+            y += line_h(font)
+        y += gap
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    buf.name = "vacancy.png"
+    return buf
 # ---------- seen_ids ----------
 
 def load_seen() -> set:
@@ -322,39 +421,65 @@ async def main():
         except Exception as e:
             print(f"  [error] не удалось отрендерить вакансию {vac_id}: {e}")
             continue
-        new_posts.append((vac_id, v.get("job-name"), v.get("_company_display_name"), post_text))
+        new_posts.append(
+            (vac_id, v.get("job-name"), v.get("_company_display_name"), post_text, v)
+        )
 
     print(f"Новых вакансий для публикации: {len(new_posts)}")
     if not new_posts:
         print("Новых вакансий нет — планировать нечего.")
         return
+
     print("[telegram] Подключение к Telegram API...")
+    scheduled_count = 0
+
     async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
         entity = await client.get_entity(CHANNEL)
 
         # Каждый следующий пост сдвигаем на 3 минуты, чтобы они выходили постепенно
         base_time = datetime.now(timezone.utc) + timedelta(hours=POST_DELAY_HOURS)
-        
-        for i, (vac_id, job_name, company_name, post_text) in enumerate(new_posts):
+
+        for i, (vac_id, job_name, company_name, post_text, vac) in enumerate(new_posts):
             schedule_time = base_time + timedelta(minutes=3 * i)
-            
-            # Безопасный цикл отправки с автоматическим ожиданием при лимитах флуда
+
+            # Безопасный цикл отправки с ожиданием при лимитах флуда
             while True:
                 try:
-                    await client.send_message(
-                        entity,
-                        post_text,
-                        parse_mode="markdown",  # Переключите на "html", если используете HTML в шаблоне
-                        schedule=schedule_time,
-                        link_preview=False,
-                    )
+                    image = generate_image(vac)
+
+                    if len(post_text) <= 1024:
+                        # Лимит подписи к фото в Telegram — 1024 символа
+                        await client.send_file(
+                            entity,
+                            image,
+                            caption=post_text,
+                            parse_mode="html",
+                            schedule=schedule_time,
+                        )
+                    else:
+                        # Не влезает в подпись: сначала картинка, через минуту текст
+                        await client.send_file(
+                            entity,
+                            image,
+                            schedule=schedule_time,
+                        )
+                        await asyncio.sleep(2)
+                        await client.send_message(
+                            entity,
+                            post_text,
+                            parse_mode="html",
+                            schedule=schedule_time + timedelta(minutes=1),
+                            link_preview=False,
+                        )
+
                     seen.add(vac_id)
+                    scheduled_count += 1
                     print(f"  [scheduled] {job_name} — {company_name} -> {schedule_time.isoformat()}")
-                    
+
                     # Защитная микропауза между запросами к API Telegram
                     await asyncio.sleep(4)
                     break
-                    
+
                 except FloodWaitError as e:
                     print(f"  [flood] Превышен лимит запросов Telegram. Спим {e.seconds} секунд...")
                     await asyncio.sleep(e.seconds + 2)
@@ -363,7 +488,7 @@ async def main():
                     break
 
     save_seen(seen)
-    print(f"\nУспешно. Поставлено в отложку: {len(new_posts)}")
+    print(f"\nУспешно. Поставлено в отложку: {scheduled_count} из {len(new_posts)}")
 
 
 if __name__ == "__main__":
