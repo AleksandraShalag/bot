@@ -62,7 +62,19 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; vacancy-bot/1.0)",
     "Accept": "application/json",
 }
-
+def collect_all_vacancies(companies: list[dict]) -> list[dict]:
+    all_vacancies = []
+    for company in companies:
+        print(f"[fetch] {company['name']} ({company['id_type']}={company['id']})")
+        try:
+            items = fetch_company_vacancies(company)
+            for item in items:
+                item["_company_display_name"] = company["name"]
+            all_vacancies.extend(items)
+            print(f"  -> найдено {len(items)} вакансий")
+        except Exception as e:
+            print(f"  [error] компания {company['name']} упала: {e}")
+    return all_vacancies
 
 def _get_with_retry(client, url, params, attempts=4):
     """GET с повтором при 429/5xx/сетевых сбоях и растущей паузой."""
