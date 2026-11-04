@@ -59,9 +59,11 @@ def save_seen(seen: set) -> None:
 # ---------- Сбор вакансий из API ----------
 
 def fetch_company_vacancies(company: dict) -> list[dict]:
-    id_type = company["id_type"]
+    id_type = company["id_type"].lower().strip() # "inn" или "ogrn"
     company_id = re.sub(r"\s+", "", str(company["id"]).strip())
-    url = f"{API_BASE}/{id_type}/{company_id}"
+    
+    # Формируем правильный URL согласно API: /vacancies/company/inn/{inn}
+    url = f"{API_BASE}/inn/{company_id}" if id_type == "inn" else f"{API_BASE}/ogrn/{company_id}"
 
     all_vacancies = []
     offset = 0
@@ -86,6 +88,7 @@ def fetch_company_vacancies(company: dict) -> list[dict]:
                 break
             offset += PAGE_LIMIT
     return all_vacancies
+
 
 
 def collect_all_vacancies(companies: list[dict]) -> list[dict]:
