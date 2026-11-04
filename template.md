@@ -15,6 +15,5 @@
 {% if contact_person %}👤 {{ contact_person }}
 {% endif %}{% if phone %}📞 {{ phone }}
 {% endif %}{% if email %}✉️ {{ email }}
-{% endif %}{% if company_website %}🌐 Сайт компании: {{ company_website }}
 {% endif %}
 🔗 Подробнее о вакансии: {{ vac_url }}
