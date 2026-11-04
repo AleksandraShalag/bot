@@ -1,4 +1,4 @@
-🔥 <b>{{ title }}</b>
+🔥 **{{ title }}**
 🏢 {{ company }}
 📍 {{ region }}{% if address %}, {{ address }}{% endif %}{% if remote %} · 🏠 удалённо{% endif %}
 💼 {{ employment_label }}{% if schedule %} · {{ schedule }}{% endif %}{% if experience_label %} · {{ experience_label }}{% endif %}
@@ -11,7 +11,7 @@
 {% endif %}
 {{ tags | join(' ') }}
 
-<b>Контакты:</b>
+**Контакты:**
 {% if contact_person %}👤 {{ contact_person }}
 {% endif %}{% if phone %}📞 {{ phone }}
 {% endif %}{% if email %}✉️ {{ email }}
