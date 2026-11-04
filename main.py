@@ -57,38 +57,40 @@ def save_seen(seen: set) -> None:
 
 
 # ---------- Сбор вакансий из API ----------
-
 def fetch_company_vacancies(company: dict) -> list[dict]:
-    id_type = company["id_type"].lower().strip() # "inn" или "ogrn"
-    company_id = re.sub(r"\s+", "", str(company["id"]).strip())
-    
-    # Формируем правильный URL согласно API: /vacancies/company/inn/{inn}
-    url = f"{API_BASE}/inn/{company_id}" if id_type == "inn" else f"{API_BASE}/ogrn/{company_id}"
+    """Постранично забирает все вакансии компании по ИНН/ОГРН."""
+    id_type = company["id_type"]
+    # Убираем пробелы/табы/переносы строк — частая проблема при копировании
+    # ИНН из таблиц (Excel и т.п.), из-за которой ломается URL запроса.
+    company_id = str(company["id"]).strip()
+    company_id = re.sub(r"\s+", "", company_id)
+    url = f"{API_BASE}/{id_type}/{company_id}"
 
     all_vacancies = []
     offset = 0
     with httpx.Client(timeout=30) as client_http:
         while True:
+            params = {"limit": PAGE_LIMIT, "offset": offset}
             try:
-                resp = client_http.get(url, params={"limit": PAGE_LIMIT, "offset": offset})
+                resp = client_http.get(url, params=params)
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
-                print(f"  [error] запрос к API упал: {e}")
-                break
-
+@@ -112,16 +74,13 @@ def fetch_company_vacancies(company: dict) -> list[dict]:
             vacancies = data.get("results", {}).get("vacancies", [])
             if not vacancies:
                 break
+
             for item in vacancies:
                 v = item.get("vacancy", {})
                 if v:
                     all_vacancies.append(v)
+
             if len(vacancies) < PAGE_LIMIT:
                 break
             offset += PAGE_LIMIT
-    return all_vacancies
 
+    return all_vacancies
 
 
 def collect_all_vacancies(companies: list[dict]) -> list[dict]:
