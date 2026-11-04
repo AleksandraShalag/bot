@@ -17,12 +17,13 @@ from datetime import datetime, timedelta, timezone
 from jinja2 import Template
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.errors.rpcerrorlist import FloodWaitError
 
 COMPANIES_FILE = "companies.yaml"
 TEMPLATE_FILE = "template.md"
 SEEN_FILE = "seen_ids.json"
 
-API_BASE = "https://opendata.trudvsem.ru/api/v1/vacancies/company"
+API_BASE = "https://trudvsem.ru"
 PAGE_LIMIT = 100
 POST_DELAY_HOURS = 6  # через сколько часов после запуска публиковать
 
@@ -43,7 +44,10 @@ EMPLOYMENT_LABELS = {
 def load_seen() -> set:
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+            try:
+                return set(json.load(f))
+            except json.JSONDecodeError:
+                return set()
     return set()
 
 
@@ -259,7 +263,7 @@ def render_post(v: dict, template_text: str) -> str:
         region=(v.get("region") or {}).get("name", "Не указано"),
         address=get_address(v),
         remote=remote,
-        employment_label=EMPLOYMENT_LABELS[employment_key],
+        employment_label=EMPLOYMENT_LABELS.get(employment_key, "занятость не указана"),
         schedule=v.get("schedule"),
         experience_label=experience_label,
         salary_text=format_salary(v),
@@ -279,6 +283,10 @@ def render_post(v: dict, template_text: str) -> str:
 # ---------- Основной сценарий ----------
 
 async def main():
+    if not os.path.exists(COMPANIES_FILE) or not os.path.exists(TEMPLATE_FILE):
+        print("[error] Отсутствует файл companies.yaml или template.md")
+        return
+
     with open(COMPANIES_FILE, "r", encoding="utf-8") as f:
         companies = yaml.safe_load(f)
     with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
@@ -300,30 +308,46 @@ async def main():
             continue
         new_posts.append((vac_id, v.get("job-name"), v.get("_company_display_name"), post_text))
 
+    print(f"Новых вакансий для публикации: {len(new_posts)}")
     if not new_posts:
         print("Новых вакансий нет — планировать нечего.")
         return
-
+    print("[telegram] Подключение к Telegram API...")
     async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
         entity = await client.get_entity(CHANNEL)
 
-        # Каждый следующий пост ставим на пару минут позже предыдущего,
-        # чтобы они не выходили все одновременно одной пачкой.
+        # Каждый следующий пост сдвигаем на 3 минуты, чтобы они выходили постепенно
         base_time = datetime.now(timezone.utc) + timedelta(hours=POST_DELAY_HOURS)
+        
         for i, (vac_id, job_name, company_name, post_text) in enumerate(new_posts):
             schedule_time = base_time + timedelta(minutes=3 * i)
-            await client.send_message(
-                entity,
-                post_text,
-                parse_mode="html",
-                schedule=schedule_time,
-                link_preview=False,
-            )
-            seen.add(vac_id)
-            print(f"  [scheduled] {job_name} — {company_name} -> {schedule_time.isoformat()}")
+            
+            # Безопасный цикл отправки с автоматическим ожиданием при лимитах флуда
+            while True:
+                try:
+                    await client.send_message(
+                        entity,
+                        post_text,
+                        parse_mode="markdown",  # Переключите на "html", если используете HTML в шаблоне
+                        schedule=schedule_time,
+                        link_preview=False,
+                    )
+                    seen.add(vac_id)
+                    print(f"  [scheduled] {job_name} — {company_name} -> {schedule_time.isoformat()}")
+                    
+                    # Защитная микропауза между запросами к API Telegram
+                    await asyncio.sleep(4)
+                    break
+                    
+                except FloodWaitError as e:
+                    print(f"  [flood] Превышен лимит запросов Telegram. Спим {e.seconds} секунд...")
+                    await asyncio.sleep(e.seconds + 2)
+                except Exception as e:
+                    print(f"  [error] Ошибка отправки для ID {vac_id}: {e}")
+                    break
 
     save_seen(seen)
-    print(f"\nГотово. Поставлено в отложку: {len(new_posts)}")
+    print(f"\nУспешно. Поставлено в отложку: {len(new_posts)}")
 
 
 if __name__ == "__main__":
