@@ -120,7 +120,7 @@ def generate_image(v: dict) -> io.BytesIO:
     title = str(v.get("job-name", "Без названия")).upper()
     city = extract_city(v).upper()
     company = str(v.get("_company_display_name") or (v.get("company") or {}).get("name", "")).upper()
-    salary = (format_salary(v) or "").upper()
+    salary = (format_salary(v) or "").replace("₽", "РУБ.").upper()
 
     blocks = []  # (шрифт, строки, цвет, отступ после блока)
     f, l = fit_block(draw, title, 110, 52, 5, max_w)
