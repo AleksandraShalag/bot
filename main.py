@@ -49,10 +49,12 @@ IMG_ACCENT = "#FFD54A"
 IMG_PADDING = 80
 
 FONT_BOLD_CANDIDATES = [
-    "fonts/bold.ttf",  # можно положить свой шрифт в репозиторий
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "fonts/bold.ttf",  # свой шрифт, если положите в репозиторий
+    "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 ]
+
 CITY_RE = re.compile(
     r"^(?:г|город|пгт|рп|п|пос|поселок|посёлок|с|село|д|деревня)\.?\s+(.+)$",
     re.IGNORECASE,
