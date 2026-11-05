@@ -467,7 +467,7 @@ async def main():
                             entity,
                             image,
                             caption=post_text,
-                            parse_mode="html",
+                            parse_mode="md",
                             schedule=schedule_time,
                         )
                     else:
@@ -481,7 +481,7 @@ async def main():
                         await client.send_message(
                             entity,
                             post_text,
-                            parse_mode="html",
+                            parse_mode="md",
                             schedule=schedule_time + timedelta(minutes=1),
                             link_preview=False,
                         )
