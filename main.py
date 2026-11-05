@@ -53,7 +53,29 @@ FONT_BOLD_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 ]
+CITY_RE = re.compile(
+    r"^(?:г|город|пгт|рп|п|пос|поселок|посёлок|с|село|д|деревня)\.?\s+(.+)$",
+    re.IGNORECASE,
+)
+CITY_RE_TAIL = re.compile(
+    r"^(.+?)\s+(?:г|город|пгт|рп|п|с|д)\.?$",
+    re.IGNORECASE,
+)
+SKIP_PARTS = ("респ", "обл", "край", "округ", "р-н", "район", "ул", "пр-кт", "проспект", "д.")
 
+
+def extract_city(v: dict) -> str:
+    """Город/населённый пункт из адреса, иначе регион."""
+    address = get_address(v) or ""
+    for part in [p.strip() for p in address.split(",") if p.strip()]:
+        low = part.lower()
+        m = CITY_RE.match(part) or CITY_RE_TAIL.match(part)
+        if m:
+            name = m.group(1).strip(" ,.")
+            if name and not any(low.startswith(s) for s in ("ул", "пр-кт")):
+                return name
+    region = (v.get("region") or {}).get("name") or ""
+    return region.split("(")[0].strip()
 
 def load_font(size: int) -> ImageFont.FreeTypeFont:
     for path in FONT_BOLD_CANDIDATES:
@@ -75,16 +97,6 @@ def wrap_text(draw, text: str, font, max_width: int) -> list[str]:
     if line:
         lines.append(line)
     return lines
-
-
-def extract_city(v: dict) -> str:
-    """Город из адреса ('г. Казань', 'город Нижнекамск'), иначе регион."""
-    address = get_address(v) or ""
-    m = re.search(r"(?:г\.|город)\s*([А-ЯЁA-Z][\w\-]*(?:\s[А-ЯЁ][\w\-]*)?)", address)
-    if m:
-        return m.group(1).strip(" ,")
-    region = (v.get("region") or {}).get("name") or ""
-    return region.split("(")[0].strip()
 
 
 def fit_block(draw, text, max_size, min_size, max_lines, max_width):
